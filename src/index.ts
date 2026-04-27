@@ -1,9 +1,45 @@
 import { Client, Events, GatewayIntentBits, Message } from "discord.js";
 import OpenAI from "openai";
 import "dotenv/config";
+import { closeSync, mkdirSync, openSync, unlinkSync } from "fs";
+import { join } from "path";
 import { MemoryManager } from "./memory";
 import { MusicPlayer } from "./music";
 import { detectAndFetchRealtimeData } from "./realtime";
+
+const runtimeDir = join(process.cwd(), ".runtime");
+mkdirSync(runtimeDir, { recursive: true });
+
+const lockPath = join(runtimeDir, "bot.lock");
+let lockFd: number | null = null;
+
+try {
+  lockFd = openSync(lockPath, "wx");
+} catch {
+  console.error("❌ Bot instance is already running. Please stop the other process first.");
+  process.exit(1);
+}
+
+const releaseLock = (): void => {
+  if (lockFd === null) return;
+  try {
+    closeSync(lockFd);
+  } catch {}
+  try {
+    unlinkSync(lockPath);
+  } catch {}
+  lockFd = null;
+};
+
+process.on("exit", releaseLock);
+process.on("SIGINT", () => {
+  releaseLock();
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  releaseLock();
+  process.exit(0);
+});
 
 const discord = new Client({
   intents: [
@@ -184,7 +220,7 @@ async function handleMusicCommand(message: Message): Promise<void> {
         text += "**คิวถัดไป:**\n";
         text += queue
           .slice(0, 10)
-          .map((item, i) => `${i + 1}. ${item.title}`)
+          .map((item: { title: string }, i: number) => `${i + 1}. ${item.title}`)
           .join("\n");
         if (queue.length > 10) text += `\n... และอีก ${queue.length - 10} เพลง`;
       }

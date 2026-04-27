@@ -9,6 +9,8 @@ import {
   joinVoiceChannel,
 } from "@discordjs/voice";
 import play from "play-dl";
+import ytdl from "@distube/ytdl-core";
+import YouTube from "youtube-sr";
 import { Message, TextChannel } from "discord.js";
 
 interface QueueItem {
@@ -23,10 +25,40 @@ interface GuildQueue {
   queue: QueueItem[];
   current: QueueItem | null;
   textChannel: TextChannel;
+  isAdvancing: boolean;
 }
 
 export class MusicPlayer {
   private queues = new Map<string, GuildQueue>();
+
+  private extractVideoId(input: string): string | null {
+    try {
+      const parsed = new URL(input.trim());
+      const host = parsed.hostname.replace(/^www\./, "").toLowerCase();
+
+      if (host === "youtu.be") {
+        const id = parsed.pathname.split("/").filter(Boolean)[0];
+        return id || null;
+      }
+
+      if (host === "youtube.com" || host.endsWith(".youtube.com")) {
+        const v = parsed.searchParams.get("v");
+        if (v) return v;
+
+        const pathParts = parsed.pathname.split("/").filter(Boolean);
+        if (pathParts[0] === "shorts" && pathParts[1]) return pathParts[1];
+        if (pathParts[0] === "embed" && pathParts[1]) return pathParts[1];
+      }
+    } catch {
+      return null;
+    }
+
+    return null;
+  }
+
+  private toWatchUrl(videoId: string): string {
+    return `https://www.youtube.com/watch?v=${videoId}`;
+  }
 
   async play(message: Message, query: string): Promise<void> {
     const member = message.member;
@@ -45,17 +77,38 @@ export class MusicPlayer {
 
     try {
       if (query.startsWith("http")) {
-        const info = await play.video_info(query);
-        url = query;
-        title = info.video_details.title ?? "Unknown";
+        const idFromUrl = this.extractVideoId(query);
+        if (idFromUrl) {
+          url = this.toWatchUrl(idFromUrl);
+          const info = await play.video_info(url);
+          title = info.video_details.title ?? "Unknown";
+        } else {
+          const video = await YouTube.getVideo(query);
+          const fallbackId = video?.id ?? this.extractVideoId(video?.url ?? "");
+          if (!fallbackId) {
+            throw new Error("Invalid video URL");
+          }
+          url = this.toWatchUrl(fallbackId);
+          title = video?.title ?? "Unknown";
+        }
       } else {
-        const results = await play.search(query, { limit: 1 });
+        const results = await YouTube.search(query, { limit: 1, type: "video" });
         if (!results.length) {
           await message.reply("ไม่เจอเพลงนี้เลย 😅");
           return;
         }
-        url = results[0].url;
-        title = results[0].title ?? "Unknown";
+
+        const result = results[0];
+        const resultId = result.id ?? this.extractVideoId(result.url ?? "");
+        if (!resultId) {
+          throw new Error("No video id from search result");
+        }
+        url = this.toWatchUrl(resultId);
+        title = result.title ?? "Unknown";
+      }
+
+      if (!url || url.includes("undefined")) {
+        throw new Error("Resolved URL is invalid");
       }
     } catch {
       await message.reply("หาเพลงไม่เจอ หรือ URL ผิด 🤔");
@@ -71,7 +124,16 @@ export class MusicPlayer {
         channelId: voiceChannel.id,
         guildId,
         adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+        selfDeaf: true,
       });
+
+      try {
+        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      } catch {
+        connection.destroy();
+        await message.reply("เชื่อมต่อห้องเสียงไม่สำเร็จ ลองใหม่อีกครั้งนะ 🙏");
+        return;
+      }
 
       const player = createAudioPlayer();
       connection.subscribe(player);
@@ -82,17 +144,18 @@ export class MusicPlayer {
         queue: [],
         current: null,
         textChannel: message.channel as TextChannel,
+        isAdvancing: false,
       };
 
       this.queues.set(guildId, guildQueue);
 
       player.on(AudioPlayerStatus.Idle, () => {
-        this.playNext(guildId);
+        void this.playNext(guildId);
       });
 
       player.on("error", (err) => {
         console.error("Player error:", err.message);
-        this.playNext(guildId);
+        void this.playNext(guildId);
       });
 
       // Auto-reconnect on disconnect
@@ -113,7 +176,6 @@ export class MusicPlayer {
 
     if (guildQueue.current === null) {
       await this.playNext(guildId);
-      await message.reply(`🎵 กำลังเล่น: **${title}**`);
     } else {
       await message.reply(
         `➕ เพิ่มในคิว: **${title}** (ตำแหน่ง ${guildQueue.queue.length})`
@@ -124,33 +186,69 @@ export class MusicPlayer {
   private async playNext(guildId: string): Promise<void> {
     const guildQueue = this.queues.get(guildId);
     if (!guildQueue) return;
+    if (guildQueue.isAdvancing) return;
 
-    if (!guildQueue.queue.length) {
-      guildQueue.current = null;
-      guildQueue.textChannel
-        .send("🎵 Queue ว่างแล้ว! เพิ่มเพลงด้วย `!play <ชื่อเพลง>`")
-        .catch(() => {});
-      return;
-    }
-
-    const item = guildQueue.queue.shift()!;
-    guildQueue.current = item;
+    guildQueue.isAdvancing = true;
+    let item: QueueItem | null = null;
 
     try {
-      const stream = await play.stream(item.url);
-      const resource = createAudioResource(stream.stream, {
-        inputType: stream.type,
-      });
+      if (!guildQueue.queue.length) {
+        if (guildQueue.current !== null) {
+          guildQueue.current = null;
+          guildQueue.textChannel
+            .send("🎵 Queue ว่างแล้ว! เพิ่มเพลงด้วย `!play <ชื่อเพลง>`")
+            .catch(() => {});
+        }
+        return;
+      }
+
+      item = guildQueue.queue.shift()!;
+      guildQueue.current = item;
+
+      if (!item.url || item.url.includes("undefined")) {
+        throw new Error("Queue item URL is invalid");
+      }
+
+      let resource;
+      try {
+        const info = await play.video_info(item.url);
+        const stream = await play.stream_from_info(info);
+        resource = createAudioResource(stream.stream, {
+          inputType: stream.type,
+        });
+      } catch (primaryErr) {
+        console.warn("Primary stream backend failed, trying fallback:", primaryErr);
+        if (!ytdl.validateURL(item.url)) {
+          throw primaryErr;
+        }
+
+        const fallbackStream = ytdl(item.url, {
+          filter: "audioonly",
+          quality: "highestaudio",
+          highWaterMark: 1 << 25,
+        });
+        resource = createAudioResource(fallbackStream);
+      }
+
       guildQueue.player.play(resource);
+
+      await entersState(guildQueue.player, AudioPlayerStatus.Playing, 10_000);
       guildQueue.textChannel
         .send(`🎵 กำลังเล่น: **${item.title}** (requested by ${item.requester})`)
         .catch(() => {});
     } catch (err) {
       console.error("Stream error:", err);
       guildQueue.textChannel
-        .send(`❌ เล่นไม่ได้: **${item.title}** — ข้ามไปเพลงถัดไป`)
+        .send(
+          `❌ เล่นไม่ได้: **${item?.title ?? "Unknown"}** — ข้ามไปเพลงถัดไป`
+        )
         .catch(() => {});
-      this.playNext(guildId);
+      guildQueue.current = null;
+      setTimeout(() => {
+        void this.playNext(guildId);
+      }, 0);
+    } finally {
+      guildQueue.isAdvancing = false;
     }
   }
 
